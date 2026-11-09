@@ -21,7 +21,6 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
-import java.io.RandomAccessFile
 import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -51,15 +50,23 @@ object EngineState {
 /**
  * Backup layout inside the destination folder:
  *   BACKUP_META.json  plaintext set metadata (salt / KDF / passphrase check)
- *   manifest.enc      MBK1-encrypted JSON manifest
- *   f/<uuid>.enc      one MBK1 stream per large file
- *   f/pack-<uuid>.enc one MBK1 stream concatenating many small files;
+ *   manifest.enc      encrypted JSON manifest, slot A
+ *   manifest-b.enc    encrypted JSON manifest, slot B (written alternately;
+ *                     the readable slot with the highest seq wins)
+ *   f/<uuid>.enc      one MBK stream per large file
+ *   f/pack-<uuid>.enc one MBK stream concatenating many small files;
  *                     manifest entries point into it as "pack-<uuid>.enc@offset:len"
  * Encryption is end-to-end on the device; the destination only sees ciphertext.
+ * Each stream is bound (AAD) to its own name, so streams cannot be swapped.
+ *
+ * Crash safety: a changed file is always written under a new name, and the
+ * manifest is switched to it only after the write succeeded. The replaced
+ * file is deleted only once no manifest slot can reference it any more.
+ * The manifest itself alternates between two slots, so an interrupted
+ * manifest write never destroys the previous good one.
  *
  * Provider access goes through DocumentsContract with one cursor query per
- * folder listing (DocumentFile would re-query per element). Known files are
- * overwritten in place instead of delete+recreate.
+ * folder listing (DocumentFile would re-query per element).
  */
 class BackupEngine(private val context: Context) {
 
@@ -75,6 +82,12 @@ class BackupEngine(private val context: Context) {
         private const val SMALL_BUFFER = 64 * 1024
         private const val PROGRESS_INTERVAL_MS = 150L
         private const val MIME_OCTET = "application/octet-stream"
+
+        private val MANIFEST_SLOTS = listOf("manifest.enc", "manifest-b.enc")
+        private const val MANIFEST_CONTEXT = "manifest"
+
+        /** Encryption context (AAD) of a stream stored as f/<name>. */
+        private fun fileContext(name: String) = "f/$name"
     }
 
     // ---------- DocumentsContract access layer ----------
@@ -166,9 +179,14 @@ class BackupEngine(private val context: Context) {
         val key: SecretKeySpec,
         val manifest: Manifest,
         val manifestExisted: Boolean,
+        /** Slot holding the newest good manifest (null = none written yet). */
+        var manifestSlot: String?,
         val fDir: TreeAccess.Child,
         val fMap: MutableMap<String, TreeAccess.Child>
-    )
+    ) {
+        /** f/ names replaced since the last successful manifest save. */
+        val replaced = mutableListOf<String>()
+    }
 
     private fun openSet(treeUri: Uri, passphrase: CharArray, create: Boolean): SetContext {
         val tree = TreeAccess(resolver, treeUri)
@@ -181,7 +199,7 @@ class BackupEngine(private val context: Context) {
             meta = BackupMeta.fromJson(readText(metaChild))
             key = ChunkedCrypto.deriveKey(passphrase, meta.salt, meta.iterations)
             val plain = try {
-                ChunkedCrypto.decryptBytes(meta.check, key)
+                ChunkedCrypto.decryptBytes(meta.check, key, BackupMeta.CHECK_CONTEXT)
             } catch (e: Exception) {
                 throw IllegalStateException("パスフレーズが違います（このバックアップのものではありません）")
             }
@@ -195,7 +213,7 @@ class BackupEngine(private val context: Context) {
             meta = BackupMeta(
                 iterations = ChunkedCrypto.DEFAULT_ITERATIONS,
                 salt = salt,
-                check = ChunkedCrypto.encryptToBytes(BackupMeta.CHECK_PLAIN, key, salt),
+                check = ChunkedCrypto.encryptToBytes(BackupMeta.CHECK_PLAIN, key, salt, BackupMeta.CHECK_CONTEXT),
                 createdAt = System.currentTimeMillis()
             )
             writeChild(tree, tree.rootDocId, rootMap, "BACKUP_META.json", "application/json") { out ->
@@ -203,19 +221,33 @@ class BackupEngine(private val context: Context) {
             }
         }
 
+        // Load the newest readable manifest slot. If manifests exist but none
+        // can be read, abort: starting fresh would overwrite the only index
+        // of the existing backup.
         var manifest = Manifest()
-        var manifestExisted = false
-        val manifestChild = rootMap["manifest.enc"]
-        if (manifestChild != null) {
+        var manifestSlot: String? = null
+        val failures = mutableListOf<String>()
+        for (slot in MANIFEST_SLOTS) {
+            val child = rootMap[slot] ?: continue
             try {
                 val out = ByteArrayOutputStream()
-                openIn(manifestChild.uri).use { ChunkedCrypto.decrypt(it, out, key) }
-                manifest = Manifest.fromJson(out.toByteArray().toString(Charsets.UTF_8))
-                manifestExisted = true
+                openIn(child.uri).use { ChunkedCrypto.decrypt(it, out, key, MANIFEST_CONTEXT) }
+                val m = Manifest.fromJson(out.toByteArray().toString(Charsets.UTF_8))
+                if (manifestSlot == null || m.seq > manifest.seq) {
+                    manifest = m
+                    manifestSlot = slot
+                }
             } catch (e: Exception) {
-                manifest = Manifest() // unreadable manifest: start fresh rather than aborting
+                failures += "$slot: ${e.message ?: e.javaClass.simpleName}"
             }
         }
+        if (manifestSlot == null && failures.isNotEmpty()) {
+            throw IllegalStateException(
+                "目録を読み込めません（破損または改ざんの可能性）。既存のバックアップを守るため中止しました: " +
+                    failures.joinToString(" / ")
+            )
+        }
+        val manifestExisted = manifestSlot != null
 
         var fDir = rootMap["f"]?.takeIf { it.isDir }
         if (fDir == null) {
@@ -224,13 +256,44 @@ class BackupEngine(private val context: Context) {
             rootMap["f"] = fDir
         }
         val fMap = tree.childrenMap(fDir.docId)
-        return SetContext(tree, rootMap, meta, key, manifest, manifestExisted, fDir, fMap)
+        return SetContext(tree, rootMap, meta, key, manifest, manifestExisted, manifestSlot, fDir, fMap)
     }
 
+    /**
+     * Writes the manifest into the slot that does NOT hold the newest good
+     * manifest, so a failed or interrupted write leaves that one intact.
+     * After a successful write, files that neither slot can reference any
+     * more (the previous manifest's trash) are deleted.
+     */
     private fun saveManifest(set: SetContext) {
-        val bytes = set.manifest.toJson().toByteArray(Charsets.UTF_8)
-        writeChild(set.tree, set.tree.rootDocId, set.rootMap, "manifest.enc", MIME_OCTET) { out ->
-            ChunkedCrypto.encrypt(java.io.ByteArrayInputStream(bytes), out, set.key, set.meta.salt, bytes.size.toLong())
+        val manifest = set.manifest
+        val oldTrash = manifest.trash
+        val oldSeq = manifest.seq
+        val target = MANIFEST_SLOTS.first { it != set.manifestSlot }
+        manifest.trash = set.replaced.toList()
+        manifest.seq = oldSeq + 1
+        try {
+            val bytes = manifest.toJson().toByteArray(Charsets.UTF_8)
+            writeChild(set.tree, set.tree.rootDocId, set.rootMap, target, MIME_OCTET) { out ->
+                ChunkedCrypto.encrypt(
+                    java.io.ByteArrayInputStream(bytes), out, set.key, set.meta.salt,
+                    bytes.size.toLong(), MANIFEST_CONTEXT
+                )
+            }
+        } catch (e: Exception) {
+            manifest.trash = oldTrash
+            manifest.seq = oldSeq
+            throw e
+        }
+        set.manifestSlot = target
+        set.replaced.clear()
+        // The slot just overwritten held the manifest these names were
+        // still referenced by; now nothing references them.
+        val referenced = manifest.files.values.mapTo(HashSet()) { it.enc.substringBefore('@') }
+        for (name in oldTrash) {
+            if (name in referenced) continue
+            val child = set.fMap[name] ?: continue
+            if (set.tree.delete(child)) set.fMap.remove(name)
         }
     }
 
@@ -354,19 +417,35 @@ class BackupEngine(private val context: Context) {
             var lastSaveAt = SystemClock.elapsedRealtime()
             var dirty = false
 
-            // ---- pack builder state (small files concatenated into one MBK1 stream) ----
+            // ---- pack builder state (small files concatenated into one MBK stream) ----
             var packTemp: File? = null
             var packOut: FileOutputStream? = null
             var packEnc: ChunkedEncryptor? = null
             var packName: String? = null
-            var packBytes = 0L
             val packPending = mutableListOf<ManifestEntry>()
 
             fun discardPack() {
                 try { packOut?.close() } catch (_: Exception) {}
                 packTemp?.delete()
                 packTemp = null; packOut = null; packEnc = null; packName = null
-                packBytes = 0; packPending.clear()
+                packPending.clear()
+            }
+
+            /**
+             * Records a failed file. A previous good entry is kept as is: its
+             * data in the backup is untouched, so the last good version stays
+             * restorable (and the file is retried next run, as size/mtime differ).
+             */
+            fun recordFailure(rel: String, size: Long, mtime: Long, message: String?) {
+                if (manifest.files[rel]?.ok == true) return
+                manifest.files[rel] = ManifestEntry(rel, size, mtime, "", ok = false, error = message)
+                dirty = true
+            }
+
+            /** Queues the previous single-file stream of [rel] for deletion, if it had one. */
+            fun retireOld(rel: String, newName: String) {
+                val old = manifest.files[rel]?.enc ?: return
+                if (old.isNotEmpty() && '@' !in old && old != newName) set.replaced += old
             }
 
             fun flushPack() {
@@ -375,32 +454,41 @@ class BackupEngine(private val context: Context) {
                 val name = packName!!
                 enc.close()
                 packOut?.close()
-                RandomAccessFile(temp, "rw").use { raf ->
-                    raf.seek(ChunkedCrypto.SIZE_FIELD_OFFSET.toLong())
-                    raf.writeLong(enc.plainBytes)
+                packOut = null
+                // always a fresh name: an existing pack is never overwritten
+                val dest = set.tree.create(set.fDir.docId, MIME_OCTET, name)
+                set.fMap[name] = dest
+                try {
+                    FileInputStream(temp).use { ins -> openOut(dest.uri).use { out -> ins.copyTo(out, IO_BUFFER) } }
+                } catch (e: Exception) {
+                    set.tree.delete(dest)
+                    set.fMap.remove(name)
+                    throw e
                 }
-                val dest = set.fMap[name] ?: set.tree.create(set.fDir.docId, MIME_OCTET, name)
-                    .also { set.fMap[name] = it }
-                FileInputStream(temp).use { ins -> openOut(dest.uri).use { out -> ins.copyTo(out, IO_BUFFER) } }
-                for (e in packPending) manifest.files[e.path] = e
+                for (e in packPending) {
+                    retireOld(e.path, name)
+                    manifest.files[e.path] = e
+                }
+                newCount += packPending.size
                 dirty = true
                 discardPack()
                 try { saveManifest(set); dirty = false; sinceSave = 0; lastSaveAt = SystemClock.elapsedRealtime() } catch (_: Exception) {}
             }
 
+            /** Pack could not be built or stored: none of its members were backed up this run. */
+            fun failPack(reason: String, e: Exception, extra: ManifestEntry? = null) {
+                val members = packPending.toList() + listOfNotNull(extra)
+                errors += "$reason (${packName ?: "-"}, ${members.size}件): ${e.message ?: e.javaClass.simpleName}"
+                for (pe in members) recordFailure(pe.path, pe.size, pe.mtime, reason)
+                discardPack()
+            }
+
             fun safeFlushPack() {
                 if (packEnc == null) return
-                val pendingSnapshot = packPending.toList()
-                val nameSnapshot = packName
                 try {
                     flushPack()
                 } catch (e: Exception) {
-                    errors += "パック保存失敗 ($nameSnapshot): ${e.message ?: e.javaClass.simpleName}"
-                    for (pe in pendingSnapshot) {
-                        manifest.files[pe.path] = pe.copy(ok = false, error = "パック保存失敗")
-                    }
-                    dirty = true
-                    discardPack()
+                    failPack("パック保存失敗", e)
                 }
             }
 
@@ -413,63 +501,67 @@ class BackupEngine(private val context: Context) {
                     if (prev != null && prev.ok && prev.size == scanned.size && prev.mtime == scanned.mtime) {
                         skipCount++
                     } else if (scanned.size < PACK_THRESHOLD) {
-                        try {
-                            val bytes = FileInputStream(file).use { it.readBytes() }
-                            if (packEnc == null) {
-                                packTemp = File.createTempFile("pack", ".tmp", context.cacheDir)
-                                packOut = FileOutputStream(packTemp)
-                                packEnc = ChunkedEncryptor(packOut!!, set.key, set.meta.salt)
-                                packName = "pack-" + UUID.randomUUID().toString() + ".enc"
-                                packBytes = 0
-                            }
-                            val offset = packBytes
-                            packEnc!!.write(bytes, 0, bytes.size)
-                            packBytes += bytes.size
-                            packPending += ManifestEntry(
-                                rel, bytes.size.toLong(), scanned.mtime,
-                                "$packName@$offset:${bytes.size}", ok = true
-                            )
-                            newCount++
-                            if (packBytes >= PACK_TARGET) safeFlushPack()
+                        // Reading the source is separate from writing the pack: an
+                        // unreadable file must not throw away the files already packed.
+                        val bytes = try {
+                            FileInputStream(file).use { it.readBytes() }
                         } catch (e: Exception) {
                             errors += "$rel: ${e.message ?: e.javaClass.simpleName}"
-                            manifest.files[rel] = ManifestEntry(
-                                rel, scanned.size, scanned.mtime,
-                                prev?.enc ?: "", ok = false, error = e.message
-                            )
-                            dirty = true
-                            discardPack() // offsets are no longer trustworthy
+                            recordFailure(rel, scanned.size, scanned.mtime, e.message)
+                            null
+                        }
+                        if (bytes != null) {
+                            var entry: ManifestEntry? = null
+                            try {
+                                if (packEnc == null) {
+                                    packName = "pack-" + UUID.randomUUID().toString() + ".enc"
+                                    packTemp = File.createTempFile("pack", ".tmp", context.cacheDir)
+                                    packOut = FileOutputStream(packTemp)
+                                    packEnc = ChunkedEncryptor(packOut!!, set.key, set.meta.salt, fileContext(packName!!))
+                                }
+                                val enc = packEnc!!
+                                val offset = enc.plainBytes
+                                entry = ManifestEntry(
+                                    rel, bytes.size.toLong(), scanned.mtime,
+                                    "$packName@$offset:${bytes.size}", ok = true
+                                )
+                                enc.write(bytes, 0, bytes.size)
+                                packPending += entry
+                            } catch (e: Exception) {
+                                // the local pack file itself failed (e.g. disk full):
+                                // its offsets can no longer be trusted
+                                failPack(
+                                    "パック作成失敗", e,
+                                    entry ?: ManifestEntry(rel, scanned.size, scanned.mtime, "", ok = false)
+                                )
+                            }
+                            if ((packEnc?.plainBytes ?: 0L) >= PACK_TARGET) safeFlushPack()
                         }
                     } else {
-                        val requested = prev?.enc?.takeIf { '@' !in it } ?: (UUID.randomUUID().toString() + ".enc")
-                        var destChild = set.fMap[requested]
-                        val createdNow = destChild == null
+                        // Always write a changed file under a new name; the old
+                        // stream stays intact until the manifest no longer needs it.
+                        val newName = UUID.randomUUID().toString() + ".enc"
+                        var created: TreeAccess.Child? = null
                         try {
-                            if (destChild == null) {
-                                destChild = set.tree.create(set.fDir.docId, MIME_OCTET, requested)
-                                set.fMap[requested] = destChild
-                            }
+                            val child = set.tree.create(set.fDir.docId, MIME_OCTET, newName)
+                            created = child
+                            set.fMap[newName] = child
                             FileInputStream(file).use { ins ->
-                                openOut(destChild.uri).use { out ->
-                                    ChunkedCrypto.encrypt(ins, out, set.key, set.meta.salt, scanned.size)
+                                openOut(child.uri).use { out ->
+                                    ChunkedCrypto.encrypt(ins, out, set.key, set.meta.salt, scanned.size, fileContext(newName))
                                 }
                             }
-                            manifest.files[rel] = ManifestEntry(
-                                rel, scanned.size, scanned.mtime, destChild.name, ok = true
-                            )
+                            retireOld(rel, newName)
+                            manifest.files[rel] = ManifestEntry(rel, scanned.size, scanned.mtime, newName, ok = true)
                             newCount++
                             dirty = true
                         } catch (e: Exception) {
                             errors += "$rel: ${e.message ?: e.javaClass.simpleName}"
-                            manifest.files[rel] = ManifestEntry(
-                                rel, scanned.size, scanned.mtime,
-                                destChild?.name ?: requested, ok = false, error = e.message
-                            )
-                            dirty = true
-                            if (createdNow && destChild != null) {
-                                set.tree.delete(destChild)
-                                set.fMap.remove(requested)
+                            if (created != null) {
+                                set.tree.delete(created)
+                                set.fMap.remove(newName)
                             }
+                            recordFailure(rel, scanned.size, scanned.mtime, e.message)
                         }
                     }
                     doneBytes += scanned.size
@@ -631,8 +723,16 @@ class BackupEngine(private val context: Context) {
                 try {
                     val encChild = set.fMap[entry.enc]
                         ?: throw IllegalStateException("暗号化ファイルが見つかりません: ${entry.enc}")
-                    openIn(encChild.uri).use { ins ->
-                        dest.open(entry.path).use { out -> ChunkedCrypto.decrypt(ins, out, set.key) }
+                    val written = openIn(encChild.uri).use { ins ->
+                        dest.open(entry.path).use { out ->
+                            ChunkedCrypto.decrypt(ins, out, set.key, fileContext(entry.enc))
+                        }
+                    }
+                    // The manifest is authenticated; a length mismatch means the
+                    // stream was truncated or replaced (legacy MBK1 streams carry
+                    // an unauthenticated length, so this is their only check).
+                    check(written == entry.size) {
+                        "サイズが目録と一致しません（目録 ${entry.size} / 実際 $written バイト）。破損または改ざんの可能性"
                     }
                     restored++
                 } catch (e: Exception) {
@@ -660,7 +760,7 @@ class BackupEngine(private val context: Context) {
                     fun closeCur() { try { curOut?.close() } catch (_: Exception) {}; curOut = null }
                     try {
                         openIn(packChild.uri).use { ins ->
-                            ChunkedCrypto.decryptStreaming(ins, set.key) { segOff, bytes, segLen ->
+                            ChunkedCrypto.decryptStreaming(ins, set.key, fileContext(packName)) { segOff, bytes, segLen ->
                                 var pos = segOff
                                 var bOff = 0
                                 val segEnd = segOff + segLen

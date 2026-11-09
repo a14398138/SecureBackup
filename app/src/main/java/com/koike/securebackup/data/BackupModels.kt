@@ -27,6 +27,9 @@ data class BackupMeta(
     companion object {
         val CHECK_PLAIN = "FULLBACKUP-CHECK-V1".toByteArray(Charsets.UTF_8)
 
+        /** Encryption context (AAD) the check block is bound to. */
+        const val CHECK_CONTEXT = "check"
+
         fun fromJson(text: String): BackupMeta {
             val o = JSONObject(text)
             require(o.optInt("format", -1) == 1) { "unsupported backup format" }
@@ -54,6 +57,20 @@ class Manifest {
     val files = LinkedHashMap<String, ManifestEntry>()
     var skippedDirs: List<String> = emptyList()
 
+    /**
+     * Save counter. The manifest is written alternately to two slots; on load
+     * the readable slot with the highest seq wins, so an interrupted write
+     * never destroys the last good manifest.
+     */
+    var seq: Long = 0
+
+    /**
+     * Names in the "f" folder that this manifest no longer references but the
+     * previous manifest (in the other slot) may still reference. They are
+     * deleted only after the next manifest has been saved successfully.
+     */
+    var trash: List<String> = emptyList()
+
     fun toJson(): String {
         val arr = JSONArray()
         for (e in files.values) {
@@ -70,6 +87,8 @@ class Manifest {
         return JSONObject()
             .put("version", 1)
             .put("updatedAt", System.currentTimeMillis())
+            .put("seq", seq)
+            .put("trash", JSONArray(trash))
             .put("skippedDirs", JSONArray(skippedDirs))
             .put("files", arr)
             .toString()
@@ -95,6 +114,11 @@ class Manifest {
             val sk = o.optJSONArray("skippedDirs")
             if (sk != null) {
                 m.skippedDirs = (0 until sk.length()).map { sk.optString(it) }
+            }
+            m.seq = o.optLong("seq", 0)
+            val tr = o.optJSONArray("trash")
+            if (tr != null) {
+                m.trash = (0 until tr.length()).map { tr.optString(it) }.filter { it.isNotEmpty() }
             }
             return m
         }

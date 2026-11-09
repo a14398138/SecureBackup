@@ -2,8 +2,10 @@ package com.koike.securebackup.crypto
 
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.PushbackInputStream
 import java.nio.ByteBuffer
 import java.security.SecureRandom
+import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
@@ -11,28 +13,40 @@ import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 
 /**
- * Chunked AES-256-GCM stream format ("MBK1").
+ * Chunked AES-256-GCM stream format.
  *
- * Layout:
- *   magic "MBK1" (4) | version (1) | salt (16) | noncePrefix (8) | plainSize (8, BE)
- *   then ceil(plainSize / CHUNK) chunks. Chunk i is AES-GCM encrypted with
- *   nonce = noncePrefix || int32BE(i); each chunk's ciphertext carries its
- *   own 16-byte GCM tag, so tampering with any chunk is detected and large
- *   files never need to be held in memory.
+ * Current format "MBK2" (written by this version):
+ *   magic "MBK2" (4) | version 2 (1) | salt (16) | noncePrefix (8)
+ *   then one or more chunks. Every chunk except the last holds exactly CHUNK
+ *   plaintext bytes; the last one holds 0..CHUNK bytes and is always present
+ *   (an empty stream is a single empty final chunk). Chunk i is encrypted with
+ *     nonce = noncePrefix || int32BE(i)
+ *     AAD   = header (29) || int32BE(i) || finalFlag (1) || context (UTF-8)
+ *   so the header cannot be altered, chunks cannot be reordered, the stream
+ *   cannot be truncated at a chunk boundary (the new last chunk was sealed as
+ *   non-final and fails authentication), and a stream cannot be swapped with
+ *   another stream of the same set (each is bound to its own [context],
+ *   typically the file name the manifest refers to).
  *
- * Buffers and Cipher instances are reused through ThreadLocals so the chunk
- * loops allocate nothing per chunk.
+ * Legacy format "MBK1" (read only):
+ *   magic "MBK1" (4) | version 1 (1) | salt (16) | noncePrefix (8) | plainSize (8, BE)
+ *   with no AAD. Its plainSize is unauthenticated, so callers should compare
+ *   the decrypted length with an authenticated expectation (the manifest).
  */
 object ChunkedCrypto {
     const val CHUNK = 1 shl 20 // 1 MiB plaintext per chunk
     private const val TAG_BITS = 128
-    private const val TAG_BYTES = TAG_BITS / 8
-    private val MAGIC = byteArrayOf('M'.code.toByte(), 'B'.code.toByte(), 'K'.code.toByte(), '1'.code.toByte())
-    const val HEADER_SIZE = 4 + 1 + 16 + 8 + 8
+    const val TAG_BYTES = TAG_BITS / 8
     const val DEFAULT_ITERATIONS = 600_000
 
-    /** Byte offset of the plainSize field inside the MBK1 header. */
-    const val SIZE_FIELD_OFFSET = 29
+    private val MAGIC_V1 = "MBK1".toByteArray(Charsets.US_ASCII)
+    private val MAGIC_V2 = "MBK2".toByteArray(Charsets.US_ASCII)
+    private const val PREFIX_SIZE = 5 // magic + version byte
+
+    /** Header size of the current (MBK2) format. */
+    const val HEADER_SIZE = 4 + 1 + 16 + 8
+    /** Header size of the legacy MBK1 format. */
+    const val HEADER_SIZE_V1 = 4 + 1 + 16 + 8 + 8
 
     val random = SecureRandom() // thread-safe, shared
 
@@ -61,53 +75,72 @@ object ChunkedCrypto {
         }
     }
 
+    private fun hasMagic(bytes: ByteArray, magic: ByteArray) =
+        bytes.size >= magic.size && magic.indices.all { bytes[it] == magic[it] }
+
     /** Salt embedded in the first bytes of an encrypted stream (needs >= 21 bytes). */
     fun saltOf(headerBytes: ByteArray): ByteArray {
-        require(headerBytes.size >= 21 && MAGIC.indices.all { headerBytes[it] == MAGIC[it] }) {
-            "not an MBK1 stream"
+        require(headerBytes.size >= 21 && (hasMagic(headerBytes, MAGIC_V1) || hasMagic(headerBytes, MAGIC_V2))) {
+            "not an MBK stream"
         }
         return headerBytes.copyOfRange(5, 21)
     }
 
-    private fun chunkNonce(prefix: ByteArray, index: Int): ByteArray {
+    internal fun chunkNonce(prefix: ByteArray, index: Int): ByteArray {
         val nonce = ByteArray(12)
         prefix.copyInto(nonce, 0, 0, 8)
         ByteBuffer.wrap(nonce, 8, 4).putInt(index)
         return nonce
     }
 
-    fun encrypt(input: InputStream, output: OutputStream, key: SecretKeySpec, salt: ByteArray, plainSize: Long) {
-        require(salt.size == 16) { "salt must be 16 bytes" }
-        val noncePrefix = ByteArray(8).also { random.nextBytes(it) }
-        val header = ByteBuffer.allocate(HEADER_SIZE)
-        header.put(MAGIC)
-        header.put(1)
-        header.put(salt)
-        header.put(noncePrefix)
-        header.putLong(plainSize)
-        output.write(header.array())
-
-        val cipher = cipher()
-        val buf = plainBuf()
-        val outBuf = cipherBuf()
-        var remaining = plainSize
-        var index = 0
-        while (remaining > 0) {
-            val want = minOf(remaining, CHUNK.toLong()).toInt()
-            val got = readFully(input, buf, want)
-            check(got == want) { "source shrank while encrypting" }
-            cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(TAG_BITS, chunkNonce(noncePrefix, index)))
-            val outLen = cipher.doFinal(buf, 0, got, outBuf, 0)
-            output.write(outBuf, 0, outLen)
-            remaining -= got
-            index++
-        }
-        output.flush()
+    /** AAD template: header || index(4) || final(1) || context. Index/final are patched per chunk. */
+    internal fun aadTemplate(header: ByteArray, context: String): ByteArray {
+        val ctx = context.toByteArray(Charsets.UTF_8)
+        val aad = ByteArray(header.size + 5 + ctx.size)
+        header.copyInto(aad, 0)
+        ctx.copyInto(aad, header.size + 5)
+        return aad
     }
 
-    /** Decrypts a full MBK1 stream. Returns the plaintext size written. Throws on tampering. */
-    fun decrypt(input: InputStream, output: OutputStream, key: SecretKeySpec): Long {
-        val size = decryptStreaming(input, key) { _, bytes, len -> output.write(bytes, 0, len) }
+    internal fun setChunkAad(aad: ByteArray, headerSize: Int, index: Int, final: Boolean) {
+        ByteBuffer.wrap(aad, headerSize, 4).putInt(index)
+        aad[headerSize + 4] = if (final) 1 else 0
+    }
+
+    internal fun newHeader(salt: ByteArray, noncePrefix: ByteArray): ByteArray {
+        require(salt.size == 16) { "salt must be 16 bytes" }
+        return ByteBuffer.allocate(HEADER_SIZE)
+            .put(MAGIC_V2).put(2).put(salt).put(noncePrefix)
+            .array()
+    }
+
+    /**
+     * Encrypts exactly [plainSize] bytes of [input]. Fails if the source ends
+     * early; bytes beyond [plainSize] are ignored.
+     */
+    fun encrypt(
+        input: InputStream,
+        output: OutputStream,
+        key: SecretKeySpec,
+        salt: ByteArray,
+        plainSize: Long,
+        context: String
+    ) {
+        val enc = ChunkedEncryptor(output, key, salt, context, cipher(), plainBuf(), cipherBuf())
+        val tmp = ByteArray(64 * 1024)
+        var remaining = plainSize
+        while (remaining > 0) {
+            val n = input.read(tmp, 0, minOf(remaining, tmp.size.toLong()).toInt())
+            check(n >= 0) { "source shrank while encrypting" }
+            enc.write(tmp, 0, n)
+            remaining -= n
+        }
+        enc.close()
+    }
+
+    /** Decrypts a full stream. Returns the plaintext size written. Throws on tampering. */
+    fun decrypt(input: InputStream, output: OutputStream, key: SecretKeySpec, context: String): Long {
+        val size = decryptStreaming(input, key, context) { _, bytes, len -> output.write(bytes, 0, len) }
         output.flush()
         return size
     }
@@ -115,19 +148,76 @@ object ChunkedCrypto {
     /**
      * Decrypts chunk by chunk, reporting each plaintext chunk with its absolute
      * offset in the plaintext. The byte array passed to [sink] is a shared
-     * buffer and is only valid during the call. Every consumed chunk's GCM
-     * tag is verified.
+     * buffer and is only valid during the call. Every chunk's GCM tag is
+     * verified; for MBK2 streams truncation is detected as well.
      */
     fun decryptStreaming(
         input: InputStream,
         key: SecretKeySpec,
+        context: String,
         sink: (plainOffset: Long, bytes: ByteArray, length: Int) -> Unit
     ): Long {
-        val header = ByteArray(HEADER_SIZE)
-        check(readFully(input, header, HEADER_SIZE) == HEADER_SIZE) { "truncated header" }
-        require(MAGIC.indices.all { header[it] == MAGIC[it] } && header[4].toInt() == 1) { "not an MBK1 stream" }
+        val prefix = ByteArray(PREFIX_SIZE)
+        if (readFully(input, prefix, PREFIX_SIZE) != PREFIX_SIZE) throw AEADBadTagException("truncated header")
+        return when {
+            hasMagic(prefix, MAGIC_V2) && prefix[4].toInt() == 2 -> decryptV2(prefix, input, key, context, sink)
+            hasMagic(prefix, MAGIC_V1) && prefix[4].toInt() == 1 -> decryptV1(prefix, input, key, sink)
+            else -> throw IllegalArgumentException("not an MBK stream")
+        }
+    }
+
+    private fun decryptV2(
+        prefix: ByteArray,
+        rawInput: InputStream,
+        key: SecretKeySpec,
+        context: String,
+        sink: (Long, ByteArray, Int) -> Unit
+    ): Long {
+        val header = prefix.copyOf(HEADER_SIZE)
+        val rest = HEADER_SIZE - PREFIX_SIZE
+        if (readFully(rawInput, header, rest, PREFIX_SIZE) != rest) throw AEADBadTagException("truncated header")
+        val noncePrefix = header.copyOfRange(21, 29)
+        val aad = aadTemplate(header, context)
+        val input = PushbackInputStream(rawInput, 1)
+
+        val cipher = cipher()
+        val buf = cipherBuf()
+        val plain = plainBuf()
+        var index = 0
+        var offset = 0L
+        while (true) {
+            val n = readFully(input, buf, CHUNK + TAG_BYTES)
+            if (n < TAG_BYTES) throw AEADBadTagException("truncated stream (chunk $index)")
+            val final = if (n < CHUNK + TAG_BYTES) {
+                true
+            } else {
+                val next = input.read()
+                if (next < 0) true else { input.unread(next); false }
+            }
+            check(index >= 0) { "too many chunks" }
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_BITS, chunkNonce(noncePrefix, index)))
+            setChunkAad(aad, HEADER_SIZE, index, final)
+            cipher.updateAAD(aad)
+            val outLen = cipher.doFinal(buf, 0, n, plain, 0) // AEADBadTagException if tampered/truncated
+            sink(offset, plain, outLen)
+            offset += outLen
+            index++
+            if (final) return offset
+        }
+    }
+
+    private fun decryptV1(
+        prefix: ByteArray,
+        input: InputStream,
+        key: SecretKeySpec,
+        sink: (Long, ByteArray, Int) -> Unit
+    ): Long {
+        val header = prefix.copyOf(HEADER_SIZE_V1)
+        val rest = HEADER_SIZE_V1 - PREFIX_SIZE
+        if (readFully(input, header, rest, PREFIX_SIZE) != rest) throw AEADBadTagException("truncated header")
         val noncePrefix = header.copyOfRange(21, 29)
         val plainSize = ByteBuffer.wrap(header, 29, 8).long
+        require(plainSize >= 0) { "invalid MBK1 size" }
 
         val cipher = cipher()
         val buf = cipherBuf()
@@ -138,9 +228,9 @@ object ChunkedCrypto {
         while (remaining > 0) {
             val plainLen = minOf(remaining, CHUNK.toLong()).toInt()
             val cipherLen = plainLen + TAG_BYTES
-            check(readFully(input, buf, cipherLen) == cipherLen) { "truncated chunk $index" }
+            if (readFully(input, buf, cipherLen) != cipherLen) throw AEADBadTagException("truncated chunk $index")
             cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_BITS, chunkNonce(noncePrefix, index)))
-            val outLen = cipher.doFinal(buf, 0, cipherLen, plain, 0) // AEADBadTagException if tampered
+            val outLen = cipher.doFinal(buf, 0, cipherLen, plain, 0)
             sink(offset, plain, outLen)
             offset += outLen
             remaining -= plainLen
@@ -149,11 +239,18 @@ object ChunkedCrypto {
         return plainSize
     }
 
-    /** Decrypts only the plaintext range [offset, offset+len) of an MBK1 stream. */
-    fun decryptRange(input: InputStream, key: SecretKeySpec, offset: Long, len: Long, output: OutputStream) {
+    /** Decrypts only the plaintext range [offset, offset+len) of a stream (the whole stream is still verified). */
+    fun decryptRange(
+        input: InputStream,
+        key: SecretKeySpec,
+        context: String,
+        offset: Long,
+        len: Long,
+        output: OutputStream
+    ) {
         require(offset >= 0 && len >= 0) { "negative range" }
         val end = offset + len
-        decryptStreaming(input, key) { segOff, bytes, segLen ->
+        decryptStreaming(input, key, context) { segOff, bytes, segLen ->
             val segEnd = segOff + segLen
             if (segEnd > offset && segOff < end) {
                 val from = maxOf(0L, offset - segOff).toInt()
@@ -164,22 +261,22 @@ object ChunkedCrypto {
         output.flush()
     }
 
-    fun encryptToBytes(plain: ByteArray, key: SecretKeySpec, salt: ByteArray): ByteArray {
+    fun encryptToBytes(plain: ByteArray, key: SecretKeySpec, salt: ByteArray, context: String): ByteArray {
         val out = java.io.ByteArrayOutputStream()
-        encrypt(java.io.ByteArrayInputStream(plain), out, key, salt, plain.size.toLong())
+        encrypt(java.io.ByteArrayInputStream(plain), out, key, salt, plain.size.toLong(), context)
         return out.toByteArray()
     }
 
-    fun decryptBytes(data: ByteArray, key: SecretKeySpec): ByteArray {
+    fun decryptBytes(data: ByteArray, key: SecretKeySpec, context: String): ByteArray {
         val out = java.io.ByteArrayOutputStream()
-        decrypt(java.io.ByteArrayInputStream(data), out, key)
+        decrypt(java.io.ByteArrayInputStream(data), out, key, context)
         return out.toByteArray()
     }
 
-    private fun readFully(input: InputStream, buf: ByteArray, len: Int): Int {
+    private fun readFully(input: InputStream, buf: ByteArray, len: Int, off: Int = 0): Int {
         var read = 0
         while (read < len) {
-            val n = input.read(buf, read, len - read)
+            val n = input.read(buf, off + read, len - read)
             if (n < 0) break
             read += n
         }
@@ -188,49 +285,54 @@ object ChunkedCrypto {
 }
 
 /**
- * Incremental MBK1 encryptor for streams whose total size is not known upfront
- * (used to build "pack" archives of many small files). The header is written
- * with a placeholder size; after [close], the caller patches the 8-byte size
- * field at [ChunkedCrypto.SIZE_FIELD_OFFSET] with [plainBytes] (the output
- * must be a seekable file). Chunking and authentication are identical to
- * [ChunkedCrypto.encrypt].
+ * Incremental MBK2 encryptor for streams whose total size is not known
+ * upfront (used directly for "pack" archives of many small files, and by
+ * [ChunkedCrypto.encrypt]). A full chunk is only sealed once more data
+ * arrives, so [close] always seals the true last chunk with the final flag.
+ * Nothing needs to be patched afterwards.
  */
-class ChunkedEncryptor(
+class ChunkedEncryptor internal constructor(
     private val out: OutputStream,
     private val key: SecretKeySpec,
-    salt: ByteArray
+    salt: ByteArray,
+    context: String,
+    private val cipher: Cipher,
+    private val buf: ByteArray,
+    private val outBuf: ByteArray
 ) {
+    constructor(out: OutputStream, key: SecretKeySpec, salt: ByteArray, context: String) : this(
+        out, key, salt, context,
+        Cipher.getInstance("AES/GCM/NoPadding"),
+        ByteArray(ChunkedCrypto.CHUNK),
+        ByteArray(ChunkedCrypto.CHUNK + ChunkedCrypto.TAG_BYTES)
+    )
+
     private val noncePrefix = ByteArray(8).also { ChunkedCrypto.random.nextBytes(it) }
-    private val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-    private val buf = ByteArray(ChunkedCrypto.CHUNK)
-    private val outBuf = ByteArray(ChunkedCrypto.CHUNK + 16)
+    private val header = ChunkedCrypto.newHeader(salt, noncePrefix)
+    private val aad = ChunkedCrypto.aadTemplate(header, context)
     private var bufLen = 0
     private var index = 0
+    private var closed = false
     var plainBytes: Long = 0
         private set
 
     init {
-        require(salt.size == 16) { "salt must be 16 bytes" }
-        val header = ByteBuffer.allocate(ChunkedCrypto.HEADER_SIZE)
-        header.put(byteArrayOf('M'.code.toByte(), 'B'.code.toByte(), 'K'.code.toByte(), '1'.code.toByte()))
-        header.put(1)
-        header.put(salt)
-        header.put(noncePrefix)
-        header.putLong(0) // placeholder, patched by the caller after close()
-        out.write(header.array())
+        out.write(header)
     }
 
     fun write(b: ByteArray, off: Int, len: Int) {
+        check(!closed) { "encryptor closed" }
         var pos = off
         var remaining = len
         while (remaining > 0) {
+            // A full buffer is sealed as non-final only now that more data follows.
+            if (bufLen == ChunkedCrypto.CHUNK) sealChunk(final = false)
             val n = minOf(remaining, ChunkedCrypto.CHUNK - bufLen)
             b.copyInto(buf, bufLen, pos, pos + n)
             bufLen += n
             pos += n
             remaining -= n
             plainBytes += n
-            if (bufLen == ChunkedCrypto.CHUNK) flushChunk()
         }
     }
 
@@ -243,20 +345,22 @@ class ChunkedEncryptor(
         }
     }
 
-    private fun flushChunk() {
-        if (bufLen == 0) return
-        val nonce = ByteArray(12)
-        noncePrefix.copyInto(nonce, 0, 0, 8)
-        ByteBuffer.wrap(nonce, 8, 4).putInt(index)
-        cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(128, nonce))
+    private fun sealChunk(final: Boolean) {
+        check(index >= 0) { "too many chunks" }
+        cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(128, ChunkedCrypto.chunkNonce(noncePrefix, index)))
+        ChunkedCrypto.setChunkAad(aad, ChunkedCrypto.HEADER_SIZE, index, final)
+        cipher.updateAAD(aad)
         val outLen = cipher.doFinal(buf, 0, bufLen, outBuf, 0)
         out.write(outBuf, 0, outLen)
         bufLen = 0
         index++
     }
 
+    /** Seals the final chunk. Must be called exactly once; the stream is invalid without it. */
     fun close() {
-        flushChunk()
+        if (closed) return
+        sealChunk(final = true)
+        closed = true
         out.flush()
     }
 }
