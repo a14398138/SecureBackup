@@ -35,7 +35,13 @@ jobs:
           test -s fullbackup.keystore
 
       - name: Build release APK
-        run: gradle :app:assembleRelease --no-daemon
+        run: |
+          if gradle :app:assembleRelease --no-daemon --stacktrace > build.log 2>&1; then
+            echo "build ok"
+          else
+            python3 .github/scripts/report_failure.py
+            exit 1
+          fi
 
       - name: Prepare artifact
         run: cp app/build/outputs/apk/release/app-release.apk SecureBackup.apk
