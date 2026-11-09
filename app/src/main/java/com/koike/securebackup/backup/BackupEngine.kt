@@ -22,7 +22,10 @@ import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.RandomAccessFile
+import java.util.Collections
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import javax.crypto.spec.SecretKeySpec
 
 data class JobProgress(
@@ -66,6 +69,8 @@ class BackupEngine(private val context: Context) {
         private const val PACK_THRESHOLD = 4L * 1024 * 1024   // files smaller than this go into packs
         private const val PACK_TARGET = 48L * 1024 * 1024     // pack size before flushing
         private const val MANIFEST_EVERY = 200                // files between periodic manifest saves
+        private const val MANIFEST_SAVE_MIN_INTERVAL_MS = 30_000L // lower bound between periodic saves
+        private const val SCAN_THREADS_MAX = 8
         private const val IO_BUFFER = 256 * 1024
         private const val SMALL_BUFFER = 64 * 1024
         private const val PROGRESS_INTERVAL_MS = 150L
@@ -265,6 +270,58 @@ class BackupEngine(private val context: Context) {
 
     private data class ScannedFile(val file: File, val rel: String, val size: Long, val mtime: Long)
 
+    /**
+     * Full recursive scan of [storageRoot] with one worker per directory level
+     * branch (bounded pool). Every file is stat'ed exactly once; unreadable
+     * directories end up in the returned skipped list. Returns partial results
+     * early when EngineState.cancelRequested is set.
+     */
+    private fun scanStorage(
+        storageRoot: File,
+        excludePath: String?
+    ): Pair<List<ScannedFile>, List<String>> {
+        val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, SCAN_THREADS_MAX)
+        val pool = Executors.newFixedThreadPool(threads)
+        val all = Collections.synchronizedList(mutableListOf<ScannedFile>())
+        val skipped = Collections.synchronizedList(mutableListOf<String>())
+        val futures: MutableList<Future<*>> = Collections.synchronizedList(mutableListOf())
+
+        fun walk(dir: File) {
+            if (EngineState.cancelRequested) return
+            val children = try { dir.listFiles() } catch (e: Exception) { null }
+            if (children == null) {
+                skipped += dir.path
+                return
+            }
+            for (f in children) {
+                if (EngineState.cancelRequested) return
+                if (f.isDirectory) {
+                    if (excludePath == null || f.absolutePath != excludePath) {
+                        futures += pool.submit { walk(f) }
+                    }
+                } else if (f.isFile) {
+                    all += ScannedFile(
+                        f,
+                        f.relativeTo(storageRoot).invariantSeparatorsPath,
+                        f.length(),
+                        f.lastModified()
+                    )
+                }
+            }
+        }
+
+        futures += pool.submit { walk(storageRoot) }
+        try {
+            // Workers append new futures while we drain; loop until quiescent.
+            while (futures.isNotEmpty()) futures.removeAt(futures.size - 1).get()
+        } catch (e: Exception) {
+            // keep whatever was scanned so far
+        } finally {
+            pool.shutdownNow()
+        }
+        return ArrayList(all) to ArrayList(skipped)
+    }
+
     fun runBackup(destTreeUri: Uri, passphrase: CharArray) {
         EngineState.cancelRequested = false
         val reporter = ProgressReporter(JobProgress(running = true, kind = "backup", phase = "準備中"))
@@ -279,25 +336,12 @@ class BackupEngine(private val context: Context) {
             val manifest = set.manifest
             val oldSkippedDirs = manifest.skippedDirs
 
-            // scan the whole shared-storage area, stat-ing each file exactly once
+            // scan the whole shared-storage area, stat-ing each file exactly once,
+            // with directory traversal spread over a small thread pool
             reporter.update({ it.copy(phase = "ファイルを数えています") }, errors, force = true)
             val storageRoot = Environment.getExternalStorageDirectory()
             val excludePath = treeLocalPath(destTreeUri, storageRoot)
-            val allFiles = mutableListOf<ScannedFile>()
-            val skippedDirs = mutableListOf<String>()
-            storageRoot.walkTopDown()
-                .onEnter { dir -> excludePath == null || dir.absolutePath != excludePath }
-                .onFail { f, _ -> skippedDirs += f.path }
-                .forEach {
-                    if (it.isFile) {
-                        allFiles += ScannedFile(
-                            it,
-                            it.relativeTo(storageRoot).invariantSeparatorsPath,
-                            it.length(),
-                            it.lastModified()
-                        )
-                    }
-                }
+            val (allFiles, skippedDirs) = scanStorage(storageRoot, excludePath)
             manifest.skippedDirs = skippedDirs
             val totalBytes = allFiles.sumOf { it.size }
             val totalFiles = allFiles.size
@@ -307,6 +351,7 @@ class BackupEngine(private val context: Context) {
             var newCount = 0
             var skipCount = 0
             var sinceSave = 0
+            var lastSaveAt = SystemClock.elapsedRealtime()
             var dirty = false
 
             // ---- pack builder state (small files concatenated into one MBK1 stream) ----
@@ -340,7 +385,7 @@ class BackupEngine(private val context: Context) {
                 for (e in packPending) manifest.files[e.path] = e
                 dirty = true
                 discardPack()
-                try { saveManifest(set); dirty = false; sinceSave = 0 } catch (_: Exception) {}
+                try { saveManifest(set); dirty = false; sinceSave = 0; lastSaveAt = SystemClock.elapsedRealtime() } catch (_: Exception) {}
             }
 
             fun safeFlushPack() {
@@ -440,9 +485,18 @@ class BackupEngine(private val context: Context) {
                         },
                         errors
                     )
-                    if (dirty && ++sinceSave >= MANIFEST_EVERY) {
-                        sinceSave = 0
-                        try { saveManifest(set); dirty = false } catch (_: Exception) {}
+                    if (dirty) {
+                        sinceSave++
+                        val elapsed = SystemClock.elapsedRealtime() - lastSaveAt
+                        // 200件ごとを下限として、さらに前回の保存から
+                        // MANIFEST_SAVE_MIN_INTERVAL_MS 経っている時だけ保存する。
+                        // SAF 保存先が Google Drive 等の場合、manifest の書き換えは
+                        // そのたびに同期キューへ積まれるため回数を抑える。
+                        if (sinceSave >= MANIFEST_EVERY && elapsed >= MANIFEST_SAVE_MIN_INTERVAL_MS) {
+                            sinceSave = 0
+                            lastSaveAt = SystemClock.elapsedRealtime()
+                            try { saveManifest(set); dirty = false } catch (_: Exception) {}
+                        }
                     }
                 }
                 safeFlushPack()
