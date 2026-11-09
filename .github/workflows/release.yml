@@ -27,12 +27,22 @@ jobs:
       - name: Generate launcher icons (stdlib only, no pip/Pillow)
         run: python3 make_icon_stdlib.py
 
-      - name: Decode keystore
+      - name: Decode and verify keystore
         env:
           KEYSTORE_64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
-          echo "$KEYSTORE_64" | base64 -d > fullbackup.keystore
-          test -s fullbackup.keystore
+          printf '%s' "$KEYSTORE_64" | tr -d ' \t\r\n"' | base64 -d > fullbackup.keystore
+          SIZE=$(stat -c%s fullbackup.keystore)
+          echo "keystore decoded: $SIZE bytes"
+          if ! keytool -list -keystore fullbackup.keystore -storepass fullbackup > /tmp/kt.log 2>&1; then
+            echo "::error::keystore verification failed (size: $SIZE bytes, head: $(head -c 4 fullbackup.keystore | od -An -tx1))"
+            python3 - <<'PY'
+for ln in open('/tmp/kt.log', errors='replace').read().splitlines()[:8]:
+    if ln.strip(): print(f"::error::{ln.strip()[:400]}")
+PY
+            exit 1
+          fi
+          grep -q fullbackup /tmp/kt.log && echo "alias fullbackup: OK" || echo "::warning::alias 'fullbackup' not found in keystore listing"
 
       - name: Build release APK
         run: |
