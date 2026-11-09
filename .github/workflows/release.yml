@@ -24,14 +24,8 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: Install Pillow and generate launcher icons
-        run: |
-          python3 -m pip install --quiet pillow
-          python3 make_icon.py
+      - name: Generate launcher icons (stdlib only, no pip/Pillow)
+        run: python3 make_icon_stdlib.py
 
       - name: Decode keystore
         env:
