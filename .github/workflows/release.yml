@@ -26,7 +26,7 @@ jobs:
 
       - name: Decode keystore
         env:
-          KEYSTORE_64: ${{ secrets.KEYSTORE_64 }}
+          KEYSTORE_64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
           echo "$KEYSTORE_64" | base64 -d > fullbackup.keystore
           test -s fullbackup.keystore
