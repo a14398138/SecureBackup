@@ -35,11 +35,12 @@ jobs:
           SIZE=$(stat -c%s fullbackup.keystore)
           echo "keystore decoded: $SIZE bytes"
           if ! keytool -list -keystore fullbackup.keystore -storepass fullbackup > /tmp/kt.log 2>&1; then
-            echo "::error::keystore verification failed (size: $SIZE bytes, head: $(head -c 4 fullbackup.keystore | od -An -tx1))"
-            python3 - <<'PY'
-for ln in open('/tmp/kt.log', errors='replace').read().splitlines()[:8]:
-    if ln.strip(): print(f"::error::{ln.strip()[:400]}")
-PY
+            echo "::error::keystore verification failed (size: $SIZE bytes)"
+            python3 -c "
+            for ln in open('/tmp/kt.log', errors='replace').read().splitlines()[:8]:
+                if ln.strip():
+                    print('::error::' + ln.strip()[:400])
+            "
             exit 1
           fi
           grep -q fullbackup /tmp/kt.log && echo "alias fullbackup: OK" || echo "::warning::alias 'fullbackup' not found in keystore listing"
