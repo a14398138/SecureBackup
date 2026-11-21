@@ -3,6 +3,7 @@ package com.koike.securebackup.backup
 import android.content.ContentResolver
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.os.SystemClock
 import android.provider.DocumentsContract
@@ -82,6 +83,8 @@ class BackupEngine(private val context: Context) {
         private const val SMALL_BUFFER = 64 * 1024
         private const val PROGRESS_INTERVAL_MS = 150L
         private const val MIME_OCTET = "application/octet-stream"
+        private const val LISTING_TIMEOUT_MS = 5 * 60_000L    // max wait for a provider still loading a folder
+        private const val LISTING_POLL_MS = 1_000L
 
         private val MANIFEST_SLOTS = listOf("manifest.enc", "manifest-b.enc")
         private const val MANIFEST_CONTEXT = "manifest"
@@ -101,29 +104,45 @@ class BackupEngine(private val context: Context) {
 
         fun docUri(docId: String): Uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
 
-        /** One cursor query for the whole folder. */
-        fun childrenMap(docId: String): MutableMap<String, Child> {
+        /**
+         * One cursor query for the whole folder.
+         *
+         * Cloud providers (Google Drive) answer a folder this device has never
+         * listed with a partial or empty cursor flagged EXTRA_LOADING, and keep
+         * fetching in the background. Such a listing is re-queried until the
+         * provider reports it complete (or [timeoutMs] passes, or the job is
+         * cancelled); otherwise files that exist on the provider look missing.
+         */
+        fun childrenMap(docId: String, timeoutMs: Long = LISTING_TIMEOUT_MS): MutableMap<String, Child> {
             val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
-            val map = mutableMapOf<String, Child>()
-            resolver.query(
-                childrenUri,
-                arrayOf(
-                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                    DocumentsContract.Document.COLUMN_MIME_TYPE
-                ),
-                null, null, null
-            )?.use { c ->
-                val iId = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-                val iName = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-                val iMime = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
-                while (c.moveToNext()) {
-                    val id = c.getString(iId) ?: continue
-                    val name = c.getString(iName) ?: continue
-                    map[name] = Child(id, name, c.getString(iMime) ?: "", docUri(id))
+            val deadline = SystemClock.elapsedRealtime() + timeoutMs
+            while (true) {
+                val map = mutableMapOf<String, Child>()
+                var loading = false
+                resolver.query(
+                    childrenUri,
+                    arrayOf(
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        DocumentsContract.Document.COLUMN_MIME_TYPE
+                    ),
+                    null, null, null
+                )?.use { c ->
+                    loading = c.extras?.getBoolean(DocumentsContract.EXTRA_LOADING, false) == true
+                    val iId = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val iName = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    val iMime = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    while (c.moveToNext()) {
+                        val id = c.getString(iId) ?: continue
+                        val name = c.getString(iName) ?: continue
+                        map[name] = Child(id, name, c.getString(iMime) ?: "", docUri(id))
+                    }
                 }
+                if (!loading || EngineState.cancelRequested ||
+                    SystemClock.elapsedRealtime() >= deadline
+                ) return map
+                Thread.sleep(LISTING_POLL_MS)
             }
-            return map
         }
 
         fun create(parentDocId: String, mime: String, name: String): Child {
@@ -689,10 +708,27 @@ class BackupEngine(private val context: Context) {
 
             val storageRoot = Environment.getExternalStorageDirectory()
             val localPath = treeLocalPath(destTreeUri, storageRoot)
-            val dest: DestSink = if (localPath != null) {
+            // Direct file writes need all-files access (not required for restore
+            // in the UI, and typically not yet granted on a new device); without
+            // it, go through the SAF grant of the chosen folder instead.
+            val canWriteDirect = Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()
+            val dest: DestSink = if (localPath != null && canWriteDirect) {
                 LocalDest(File(localPath))
             } else {
                 SafDest(TreeAccess(resolver, destTreeUri))
+            }
+
+            // A stream missing from the f/ listing may just not have been
+            // loaded yet by a cloud provider: re-list f/ once before giving up.
+            var fRefreshed = false
+            fun findF(name: String): TreeAccess.Child? {
+                set.fMap[name]?.let { return it }
+                if (!fRefreshed) {
+                    fRefreshed = true
+                    reporter.update({ it.copy(phase = "保存先のファイル一覧を再取得しています") }, errors, force = true)
+                    set.fMap.putAll(set.tree.childrenMap(set.fDir.docId))
+                }
+                return set.fMap[name]
             }
 
             val entries = set.manifest.files.values.filter { it.ok }
@@ -721,8 +757,8 @@ class BackupEngine(private val context: Context) {
             for (entry in entries.filter { '@' !in it.enc }) {
                 if (EngineState.cancelRequested) throw InterruptedException("ユーザーにより中止")
                 try {
-                    val encChild = set.fMap[entry.enc]
-                        ?: throw IllegalStateException("暗号化ファイルが見つかりません: ${entry.enc}")
+                    val encChild = findF(entry.enc)
+                        ?: throw IllegalStateException("暗号化ファイルが見つかりません: ${entry.enc}（バックアップ元端末からのアップロードが未完了の可能性）")
                     val written = openIn(encChild.uri).use { ins ->
                         dest.open(entry.path).use { out ->
                             ChunkedCrypto.decrypt(ins, out, set.key, fileContext(entry.enc))
@@ -753,8 +789,8 @@ class BackupEngine(private val context: Context) {
                 }.sortedBy { it.offset }
                 var completedInPack = 0
                 try {
-                    val packChild = set.fMap[packName]
-                        ?: throw IllegalStateException("パックが見つかりません: $packName")
+                    val packChild = findF(packName)
+                        ?: throw IllegalStateException("パックが見つかりません: $packName（バックアップ元端末からのアップロードが未完了の可能性）")
                     var idx = 0
                     var curOut: OutputStream? = null
                     fun closeCur() { try { curOut?.close() } catch (_: Exception) {}; curOut = null }
